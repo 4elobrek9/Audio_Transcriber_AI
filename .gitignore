@@ -1,0 +1,8 @@
+# Folder
+models
+transcriptions
+
+# Configs and logs
+*.logs
+Config.json
+pycache/
