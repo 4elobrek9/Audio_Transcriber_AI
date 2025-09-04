@@ -8,6 +8,7 @@ import datetime
 from scipy.signal import resample
 import numpy as np
 import requests
+import re
 
 # Перед запуском скрипта, в командной строке Windows выполните: chcp 65001
 # Это установит кодировку UTF-8, чтобы символы отображались корректно.
@@ -23,10 +24,14 @@ CHUNK = 4096
 
 
 class SpeakerManager:
+    """
+    Класс для управления и идентификации спикеров на основе их голосовых векторов.
+    Сохраняет векторы в файл, чтобы "запоминать" голоса между сеансами.
+    """
     def __init__(self):
         self.speakers = {}
         self.next_speaker_id = 1
-        self.tolerance = 5.5
+        self.tolerance = 0.5
         self.load_speakers()
 
     def load_speakers(self):
@@ -169,6 +174,123 @@ def post_process_with_llm(text_to_process):
         print(f"Ошибка при подключении к Ollama: {e}")
         return "Ошибка обработки текста. Пожалуйста, убедитесь, что Ollama запущен и модель llama3:8b загружена."
 
+def get_folder_name_from_llm(text_to_process):
+    """Генерирует название папки с помощью LLM."""
+    print("Генерация названия папки с помощью AI...")
+    
+    system_prompt = (
+        "Создай короткое и лаконичное название папки для транскрипции. Название должно быть "
+        "максимум из 5 слов. Используй только русский язык. Исключи любые символы, кроме букв, цифр и пробелов."
+    )
+    
+    payload = {
+        "model": "llama3:8b",
+        "prompt": f"system: {system_prompt}\nuser: {text_to_process}",
+        "stream": False
+    }
+    
+    try:
+        response = requests.post("http://localhost:11434/api/generate", json=payload)
+        response.raise_for_status()
+        llm_response = response.json()["response"].strip()
+        # Санитизируем имя папки, заменяя недопустимые символы
+        sanitized_name = re.sub(r'[\\/:*?"<>|]', '', llm_response)
+        sanitized_name = sanitized_name.replace(" ", "_")
+        return sanitized_name
+    except requests.exceptions.RequestException as e:
+        print(f"Ошибка при подключении к Ollama для генерации имени папки: {e}")
+        return datetime.datetime.now().strftime("ошибка_имени_%Y-%m-%d_%H-%M-%S")
+
+def get_detailed_retelling_from_llm(text_to_process):
+    """Создает подробный пересказ текста."""
+    print("Создание подробного пересказа...")
+    system_prompt = (
+        "Ты — профессиональный пересказчик. Твоя задача — взять предоставленный текст, исправить все ошибки "
+        "распознавания и оформить его в связный, подробный рассказ. Не удаляй важные детали, но сделай его "
+        "более читабельным и логичным. Твоя цель — именно пересказать, а не просто суммировать."
+    )
+    payload = {
+        "model": "llama3:8b",
+        "prompt": f"system: {system_prompt}\nuser: {text_to_process}",
+        "stream": False
+    }
+    try:
+        response = requests.post("http://localhost:11434/api/generate", json=payload)
+        response.raise_for_status()
+        return response.json()["response"]
+    except requests.exceptions.RequestException as e:
+        print(f"Ошибка при получении пересказа от Ollama: {e}")
+        return "Ошибка при создании пересказа."
+
+def get_questions_from_llm(text_to_process):
+    """Генерирует 5-10 вопросов по тексту."""
+    print("Генерация вопросов...")
+    system_prompt = (
+        "На основе предоставленного текста составь от 5 до 10 вопросов. Вопросы должны быть содержательными "
+        "и побуждать к размышлениям о ключевых темах текста. Форматируй их в виде нумерованного списка."
+    )
+    payload = {
+        "model": "llama3:8b",
+        "prompt": f"system: {system_prompt}\nuser: {text_to_process}",
+        "stream": False
+    }
+    try:
+        response = requests.post("http://localhost:11434/api/generate", json=payload)
+        response.raise_for_status()
+        return response.json()["response"]
+    except requests.exceptions.RequestException as e:
+        print(f"Ошибка при генерации вопросов от Ollama: {e}")
+        return "Ошибка при создании вопросов."
+
+def rewrite_last_transcription():
+    """
+    Находит последнюю созданную папку с транскрипцией,
+    перезаписывает обработанный файл с помощью LLM.
+    """
+    print("\nЗапуск перекомпиляции последнего файла...")
+    transcription_dir = "transcriptions"
+    if not os.path.isdir(transcription_dir):
+        print("Ошибка: Папка 'transcriptions' не найдена. Сначала нужно выполнить хотя бы одну запись.")
+        return
+
+    # Находим самую последнюю папку по времени создания
+    folders = [os.path.join(transcription_dir, d) for d in os.listdir(transcription_dir) if os.path.isdir(os.path.join(transcription_dir, d))]
+    if not folders:
+        print("Ошибка: Папка 'transcriptions' пуста. Сначала нужно выполнить хотя бы одну запись.")
+        return
+    
+    latest_folder = max(folders, key=os.path.getctime)
+    raw_file_path = os.path.join(latest_folder, "transcription_raw.txt")
+    processed_file_path = os.path.join(latest_folder, "transcription_processed.txt")
+    
+    if not os.path.exists(raw_file_path):
+        print(f"Ошибка: Исходный файл '{raw_file_path}' не найден. Перекомпиляция невозможна.")
+        return
+        
+    try:
+        with open(raw_file_path, "r", encoding="utf-8") as f:
+            full_transcription_text = f.read()
+
+        print(f"Найден исходный файл: '{raw_file_path}'")
+        
+        # Запускаем LLM обработку
+        processed_text = post_process_with_llm(full_transcription_text)
+        retelling_text = get_detailed_retelling_from_llm(full_transcription_text)
+        questions_text = get_questions_from_llm(full_transcription_text)
+
+        final_output = f"## Обработанный текст и выжимка\n\n{processed_text}\n\n"
+        final_output += f"## Подробный пересказ\n\n{retelling_text}\n\n"
+        final_output += f"## Вопросы по теме\n\n{questions_text}"
+        
+        # Сохраняем результат
+        with open(processed_file_path, "w", encoding="utf-8") as f:
+            f.write(final_output)
+
+        print(f"Файл '{processed_file_path}' успешно перезаписан.")
+        
+    except Exception as e:
+        print(f"Критическая ошибка при перекомпиляции: {e}")
+
 
 def transcribe_audio_stream(vb_cable_index, vosk_model_path, speaker_model_path):
     """Слушает аудиопоток с VB-CABLE и транскрибирует его."""
@@ -186,13 +308,9 @@ def transcribe_audio_stream(vb_cable_index, vosk_model_path, speaker_model_path)
     p = pyaudio.PyAudio()
     speaker_manager = SpeakerManager()
     
-    # Создаем уникальную папку для этой сессии
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    transcription_folder = os.path.join("transcriptions", timestamp)
-    os.makedirs(transcription_folder, exist_ok=True)
-    raw_transcription_file_path = os.path.join(transcription_folder, "transcription_raw.txt")
-    processed_transcription_file_path = os.path.join(transcription_folder, "transcription_processed.txt")
-
+    full_transcription_text = ""
+    last_transcribed_text = ""
+    
     try:
         # Открываем поток только для чтения с VB-CABLE Output
         input_stream = p.open(format=FORMAT,
@@ -202,44 +320,38 @@ def transcribe_audio_stream(vb_cable_index, vosk_model_path, speaker_model_path)
                               input_device_index=vb_cable_index,
                               frames_per_buffer=CHUNK)
 
-        print(f"Программа слушает VB-CABLE. Результат будет сохранен в папке '{transcription_folder}'. Нажмите Ctrl+C для остановки.")
+        print(f"Программа слушает VB-CABLE. Нажмите Ctrl+C для остановки.")
     except Exception as e:
         print(f"КРИТИЧЕСКАЯ ОШИБКА: Не удалось открыть аудиопоток: {e}")
         return
     
-    full_transcription_text = ""
-    last_transcribed_text = ""
-    
     try:
-        with open(raw_transcription_file_path, "a", encoding="utf-8") as f:
-            while True:
-                data = input_stream.read(CHUNK, exception_on_overflow=False)
+        while True:
+            data = input_stream.read(CHUNK, exception_on_overflow=False)
+            
+            # Resample для Vosk
+            resampled_data = resample(np.frombuffer(data, dtype=np.int16), int(CHUNK * VOSK_RATE / RATE)).astype(np.int16).tobytes()
+            
+            if recognizer.AcceptWaveform(resampled_data):
+                result_data = json.loads(recognizer.Result())
+                transcription = result_data.get("text", "")
+                speaker_vector = result_data.get("spk")
                 
-                # Resample для Vosk
-                resampled_data = resample(np.frombuffer(data, dtype=np.int16), int(CHUNK * VOSK_RATE / RATE)).astype(np.int16).tobytes()
-                
-                if recognizer.AcceptWaveform(resampled_data):
-                    result_data = json.loads(recognizer.Result())
-                    transcription = result_data.get("text", "")
-                    speaker_vector = result_data.get("spk")
+                if transcription and transcription.strip() != "" and transcription.strip() != last_transcribed_text:
+                    text_to_write = transcription
+                    if speaker_vector:
+                        speaker_label = speaker_manager.get_speaker_label(speaker_vector)
+                        text_to_write = f"[{speaker_label}]: {transcription}"
                     
-                    if transcription and transcription.strip() != "" and transcription.strip() != last_transcribed_text:
-                        text_to_write = transcription
-                        if speaker_vector:
-                            speaker_label = speaker_manager.get_speaker_label(speaker_vector)
-                            text_to_write = f"[{speaker_label}]: {transcription}"
-                        
-                        f.write(text_to_write + "\n")
-                        f.flush()
-                        full_transcription_text += text_to_write + "\n"
-                        last_transcribed_text = transcription.strip()
-                        print(f"Результат: {text_to_write}")
-                else:
-                    # Продолжаем выводить частичный результат
-                    partial_result = json.loads(recognizer.PartialResult())["partial"]
-                    if partial_result.strip() != "":
-                        sys.stdout.write(partial_result + "\r")
-                        sys.stdout.flush()
+                    full_transcription_text += text_to_write + "\n"
+                    last_transcribed_text = transcription.strip()
+                    print(f"Результат: {text_to_write}")
+            else:
+                # Продолжаем выводить частичный результат
+                partial_result = json.loads(recognizer.PartialResult())["partial"]
+                if partial_result.strip() != "":
+                    sys.stdout.write(partial_result + "\r")
+                    sys.stdout.flush()
     
     except KeyboardInterrupt:
         print("\nПрограмма завершена.")
@@ -248,8 +360,6 @@ def transcribe_audio_stream(vb_cable_index, vosk_model_path, speaker_model_path)
         final_result = json.loads(recognizer.FinalResult())
         transcription = final_result.get("text", "")
         if transcription and transcription.strip() != "":
-            with open(raw_transcription_file_path, "a", encoding="utf-8") as f:
-                f.write(transcription + "\n")
             full_transcription_text += transcription + "\n"
             print(f"Результат (остаток): {transcription}")
 
@@ -261,12 +371,35 @@ def transcribe_audio_stream(vb_cable_index, vosk_model_path, speaker_model_path)
             input_stream.close()
         p.terminate()
         
-        # --- Новая логика LLM-постобработки ---
+        # --- Новая логика LLM-постобработки и генерации имени папки ---
         if full_transcription_text.strip():
+            folder_name = get_folder_name_from_llm(full_transcription_text)
+            transcription_folder = os.path.join("transcriptions", folder_name)
+            os.makedirs(transcription_folder, exist_ok=True)
+            
+            raw_transcription_file_path = os.path.join(transcription_folder, "transcription_raw.txt")
+            processed_transcription_file_path = os.path.join(transcription_folder, "transcription_processed.txt")
+            
+            # Сохраняем необработанный текст
+            with open(raw_transcription_file_path, "w", encoding="utf-8") as f:
+                f.write(full_transcription_text)
+
+            # Обрабатываем и сохраняем текст, полученный от LLM
             processed_text = post_process_with_llm(full_transcription_text)
+            
+            # Получаем подробный пересказ
+            retelling_text = get_detailed_retelling_from_llm(full_transcription_text)
+            
+            # Получаем вопросы
+            questions_text = get_questions_from_llm(full_transcription_text)
+
+            final_output = f"## Обработанный текст и выжимка\n\n{processed_text}\n\n"
+            final_output += f"## Подробный пересказ\n\n{retelling_text}\n\n"
+            final_output += f"## Вопросы по теме\n\n{questions_text}"
+            
             with open(processed_transcription_file_path, "w", encoding="utf-8") as f:
-                f.write(processed_text)
-            print(f"Обработанный текст сохранен в: {processed_transcription_file_path}")
+                f.write(final_output)
+            print(f"Транскрипции сохранены в папке '{transcription_folder}'.")
 
 if __name__ == "__main__":
     vosk_model_path, speaker_model_path = get_model_paths()
@@ -274,3 +407,6 @@ if __name__ == "__main__":
         vb_cable_index = find_vb_cable_device()
         if vb_cable_index is not None:
             transcribe_audio_stream(vb_cable_index, vosk_model_path, speaker_model_path)
+    
+    # Чтобы перекомпилировать последний файл, вызовите эту функцию
+    # rewrite_last_transcription()
