@@ -6,3 +6,8 @@ transcriptions
 *.logs
 Config.json
 pycache/
+
+# VENV
+.venv
+venv
+.venom
